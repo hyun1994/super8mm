@@ -1,9 +1,9 @@
 import re
+import numpy as np
 from pathlib import Path
-from moviepy.editor import VideoFileClip, CompositeVideoClip, concatenate_videoclips
+from moviepy.editor import VideoFileClip, CompositeVideoClip, concatenate_videoclips, ColorClip
 
 # ========== 1. 경로 설정 ==========
-
 SOURCE_DIR = Path("영상위치")
 ASSET_DIR = Path("8mm효과소스위치")
 
@@ -11,151 +11,111 @@ GRAIN_FILE = ASSET_DIR / "Super 8 Grain.mp4"
 LEAK_FILE = ASSET_DIR / "Film Light Leak.mp4"
 EFFECT_24FPS_FILE = ASSET_DIR / "Super 8 24fps.mp4"
 
-TARGET_WIDTH = 1080
+# ========== 2. 비율 및 해상도 설정 ==========
+TARGET_RATIO = 4/3
+TARGET_HEIGHT = 1080
+TARGET_WIDTH = int(TARGET_HEIGHT * TARGET_RATIO) 
 TARGET_FPS = 24
 
 OUTPUT_DIR = Path.home() / "super8_output"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-OUTPUT_PATH = OUTPUT_DIR / "Kodak50D_super8mm.mp4"
+OUTPUT_PATH = OUTPUT_DIR / "Kodak50D.mp4"
 
-
-# ========== 2. 숫자 추출해서 자동 정렬하는 함수 ==========
+# ========== 3. 유틸리티 함수 ==========
 
 def extract_number(filename: str):
     match = re.search(r'(\d+)', filename)
     return int(match.group()) if match else 999999
 
-
 def load_source_files_sorted():
-    files = list(SOURCE_DIR.glob("*.MOV")) + list(SOURCE_DIR.glob("*.mp4"))
-    files = sorted(files, key=lambda f: extract_number(f.name))
-    print("[INFO] 자동 정렬된 소스:", [f.name for f in files])
-    return files
-
-
-# ========== 3. 더 날린 Kodak 50D 톤 ==========
+    exts = ["*.MOV", "*.mov", "*.MP4", "*.mp4"]
+    files = []
+    for e in exts: files.extend(SOURCE_DIR.glob(e))
+    return sorted(files, key=lambda f: extract_number(f.name))
 
 def apply_kodak50d_fade_tone(img):
-    """
-    Kodak 50D 느낌:
-    - shadow lift 더 강하게
-    - contrast 낮추기
-    - highlight soft
-    - daylight yellow tone 강조
-    """
-    import numpy as np
-
     arr = img.astype("float32") / 255.0
+    arr = arr * 0.88 + 0.06
+    arr = (arr - 0.5) * 1.02 + 0.5
+    r, g, b = arr[:,:,0]*1.05+0.02, arr[:,:,1]*1.03+0.01, arr[:,:,2]*0.97
+    return (np.clip(np.stack([r,g,b], axis=2), 0, 1) * 255).astype("uint8")
 
-    # 1) 더 강한 fade: blacks lift + whites soft
-    arr = arr * 0.88 + 0.06   # 기존 0.95/0.03 → 더 페이드
+def fit_to_target(clip, target_w, target_h):
+    # 가로/세로 중 어디에 맞출지 계산
+    scale_h = target_h / clip.h
+    scale_w = target_w / clip.w
+    scale = min(scale_h, scale_w)
+    
+    clip_resized = clip.resize(scale)
+    bg = ColorClip(size=(target_w, target_h), color=(0,0,0)).set_duration(clip.duration)
+    return CompositeVideoClip([bg, clip_resized.set_position("center")])
 
-    # 2) contrast 더 낮은 커브
-    arr = (arr - 0.5) * 1.02 + 0.5  # 기존 1.05 → 1.02
-
-    # 3) warm daylight 방향의 노란 톤
-    r = arr[:, :, 0] * 1.05 + 0.02
-    g = arr[:, :, 1] * 1.03 + 0.01
-    b = arr[:, :, 2] * 0.97
-
-    arr[:, :, 0] = r
-    arr[:, :, 1] = g
-    arr[:, :, 2] = b
-
-    arr = np.clip(arr, 0.0, 1.0)
-    arr = (arr * 255.0).astype("uint8")
-    return arr
-
-
-# ========== 4. 개별 클립 처리 ==========
+# ========== 4. 클립 처리 로직 (with문 제거) ==========
 
 def process_clip_kodak50d_fade(path: Path):
-    print(f"[PROCESS] Kodak 50D Fade 적용: {path.name}")
-
-    base = VideoFileClip(str(path)).resize(width=TARGET_WIDTH).set_fps(TARGET_FPS)
-
-    # Kodak 50D 더 페이드 톤 적용
+    print(f"[PROCESS] 처리 중: {path.name}")
+    
+    # 여기서 clip을 닫지 않고 반환합니다.
+    clip = VideoFileClip(str(path))
+    base = fit_to_target(clip, TARGET_WIDTH, TARGET_HEIGHT).set_fps(TARGET_FPS)
     base = base.fl_image(apply_kodak50d_fade_tone)
 
-    grain = (
-        VideoFileClip(str(GRAIN_FILE))
-        .loop(duration=base.duration)
-        .resize(base.size)
-        .set_opacity(0.35)   # 페이드니까 그레인은 조금 더 보이게
-    )
+    # 효과 레이어
+    grain = (VideoFileClip(str(GRAIN_FILE))
+             .loop(duration=base.duration)
+             .resize(width=TARGET_WIDTH, height=TARGET_HEIGHT)
+             .set_opacity(0.35))
+    
+    leak = (VideoFileClip(str(LEAK_FILE))
+            .loop(duration=base.duration)
+            .resize(width=TARGET_WIDTH, height=TARGET_HEIGHT)
+            .set_opacity(0.10))
 
-    leak = (
-        VideoFileClip(str(LEAK_FILE))
-        .loop(duration=base.duration)
-        .resize(base.size)
-        .set_opacity(0.10)   # leak는 낮게
-    )
-
+    # 오버레이 소스들은 오디오가 없으므로 base의 오디오를 명시적으로 유지
     comp = CompositeVideoClip([base, grain, leak]).set_audio(base.audio)
-
     return comp
 
-
-# ========== 5. 24fps 효과 세그먼트 생성 ==========
-
-def make_24fps_effect_segment(duration_sec: float):
+def make_effect_segment(duration_sec: float):
     eff = VideoFileClip(str(EFFECT_24FPS_FILE))
-
     if eff.duration < duration_sec:
         eff = eff.loop(duration=duration_sec)
+    
+    eff_sub = eff.subclip(0, duration_sec)
+    return fit_to_target(eff_sub, TARGET_WIDTH, TARGET_HEIGHT).set_fps(TARGET_FPS).without_audio()
 
-    eff = (
-        eff.subclip(0, duration_sec)
-            .resize(width=TARGET_WIDTH)
-            .set_fps(TARGET_FPS)
-            .without_audio()
-    )
+# ========== 5. 메인 실행 ==========
 
-    return eff
+if __name__ == "__main__":
+    sources = load_source_files_sorted()
+    if not sources:
+        print("파일 없음"); exit()
 
+    # 클립 리스트 생성
+    processed_clips = [process_clip_kodak50d_fade(f) for f in sources]
 
-# ========== 6. 최종 타임라인 구성 ==========
+    # 인트로/미드롤/아웃트로 생성
+    intro = make_effect_segment(2.0)
+    mid = make_effect_segment(1.0)
+    outro = make_effect_segment(2.0)
 
-def build_timeline():
-    sources = load_source_files_sorted()   # 자동 정렬된 파일 목록
-
-    clips = [process_clip_kodak50d_fade(f) for f in sources]
-
-    intro = make_24fps_effect_segment(2.0)
-    mid = make_24fps_effect_segment(1.0)
-    outro = make_24fps_effect_segment(2.0)
-
-    # 예:
-    # intro → clip1 → mid → clip2 → mid → clip3 → outro
     timeline = [intro]
-
-    for idx, c in enumerate(clips):
+    for idx, c in enumerate(processed_clips):
         timeline.append(c)
-        if idx < len(clips) - 1:
+        if idx < len(processed_clips) - 1:
             timeline.append(mid)
-
     timeline.append(outro)
 
     final = concatenate_videoclips(timeline, method="compose")
-    return final
-
-
-# ========== 7. 메인 실행 ==========
-
-if __name__ == "__main__":
-    print("[START] Kodak 50D Fade Super8mm 렌더링")
-
-    final_clip = build_timeline()
-
-    print(f"[WRITE] 출력 파일: {OUTPUT_PATH}")
-    final_clip.write_videofile(
+    
+    print(f"[WRITE] 시작: {OUTPUT_PATH}")
+    # 오디오 인코딩 에러 방지를 위해 temp_audiofile 활용 및 파라미터 최적화
+    final.write_videofile(
         str(OUTPUT_PATH),
         codec="libx264",
         audio_codec="aac",
         fps=TARGET_FPS,
-        bitrate="8M",
-        preset="medium",
         threads=4,
+        preset="ultrafast" # 테스트를 위해 속도 우선, 나중에 medium으로 변경 가능
     )
 
-    print("[DONE] 렌더링 완료!")
+    print("[DONE] 완료!")
